@@ -1,115 +1,105 @@
-# Windows Update PowerShell-Skript mit detailliertem Logging und automatischer Installation
-# Startzeit: 02:00 Uhr (über Task Scheduler empfohlen)
-# Protokolliert Updates und Neustart-Status in UpdateLog.txt
+#Requires -Version 5.1
+# Windows Update Automater - PowerShell-only, unattended, detailliertes Logging.
+# Empfohlen via Task Scheduler als SYSTEM/Admin (z.B. taeglich 02:00 Uhr).
 
-# Log-Datei und Zeitstempel initialisieren
+$ErrorActionPreference = 'Stop'
+
+# --- Logging -------------------------------------------------------------
 $LogFile = "$env:SystemDrive\UpdateLog.txt"
-Function Write-Log($Message) {
-    $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $LogFile -Value "$TimeStamp $Message"
+function Write-Log {
+    param([string]$Level, [string]$Message)
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts [$Level] $Message"
+    Add-Content -Path $LogFile -Value $line
+    Write-Host $line
 }
 
-# Prüfen, ob Internetverbindung besteht
-Write-Log "[INFO] Pruefe Internetverbindung..."
-if (!(Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet)) {
-    Write-Log "[ERROR] Keine Internetverbindung. Updates abgebrochen."
-    Write-Host "[ERROR] Keine Internetverbindung. Updates abgebrochen."
-    exit
-}
-Write-Log "[INFO] Internetverbindung erfolgreich geprueft."
+Write-Log INFO "===== Update-Lauf gestartet ====="
 
-# Prüfen und Installieren des PSWindowsUpdate-Moduls
+# --- Execution policy (nur fuer diesen Prozess) --------------------------
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force } catch {}
+
+# --- Adminrechte pruefen -------------------------------------------------
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Log ERROR "Skript benoetigt Administratorrechte. Abbruch."
+    exit 1
+}
+
+# --- Internetverbindung --------------------------------------------------
+Write-Log INFO "Pruefe Internetverbindung..."
+if (-not (Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet)) {
+    Write-Log ERROR "Keine Internetverbindung. Updates abgebrochen."
+    exit 1
+}
+Write-Log INFO "Internetverbindung ok."
+
+# --- PSWindowsUpdate sicherstellen (standardmaessig nicht vorhanden) ------
+try {
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {}
+
 if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
-    Write-Log "[INFO] PSWindowsUpdate-Modul nicht gefunden. Versuche zu installieren..."
+    Write-Log INFO "PSWindowsUpdate nicht gefunden - installiere..."
     try {
-        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers -ErrorAction Stop
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop | Out-Null
+        if (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue) {
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+        }
         Install-Module -Name PSWindowsUpdate -Force -AllowClobber -Scope AllUsers -ErrorAction Stop
-        Write-Log "[INFO] Modul PSWindowsUpdate erfolgreich installiert."
+        Write-Log INFO "PSWindowsUpdate installiert."
     } catch {
-        Write-Log "[ERROR] Fehler bei der Installation von PSWindowsUpdate: $_"
-        Write-Host "[ERROR] Fehler bei der Installation von PSWindowsUpdate: $_"
-        exit
+        Write-Log ERROR "Installation von PSWindowsUpdate fehlgeschlagen: $_"
+        exit 1
     }
 } else {
-    Write-Log "[INFO] PSWindowsUpdate-Modul ist bereits installiert."
+    Write-Log INFO "PSWindowsUpdate bereits vorhanden."
 }
+Import-Module PSWindowsUpdate -ErrorAction Stop
 
-# Microsoft Update-Dienst aktivieren
-Write-Log "[INFO] Aktiviere Microsoft Update-Dienst..."
+# --- Microsoft Update-Dienst registrieren (Treiber/Office etc.) ----------
 try {
-    $ServiceManager = New-Object -ComObject Microsoft.Update.ServiceManager
-    $ServiceManager.AddService2('7971f918-a847-4430-9279-4a52d1efe18d', 7, '') | Out-Null
-    Write-Log "[INFO] Microsoft Update-Dienst erfolgreich aktiviert."
+    (New-Object -ComObject Microsoft.Update.ServiceManager).AddService2(
+        '7971f918-a847-4430-9279-4a52d1efe18d', 7, '') | Out-Null
+    Write-Log INFO "Microsoft Update-Dienst registriert."
 } catch {
-    Write-Log "[ERROR] Fehler beim Aktivieren des Microsoft Update-Dienstes: $_"
+    Write-Log WARN "Microsoft Update-Dienst konnte nicht registriert werden: $_"
 }
 
-# Starte zusätzlichen Update-Scan mit usoclient
-Write-Log "[INFO] Starte zusätzlichen Update-Scan mit usoclient..."
-Start-Process -FilePath "usoclient.exe" -ArgumentList "StartScan" -NoNewWindow -Wait
-
-# Suche nach verfügbaren Updates
-Write-Log "[INFO] Starte Suche nach Windows Updates..."
-Import-Module PSWindowsUpdate
-$updates = Get-WindowsUpdate -MicrosoftUpdate -ErrorAction SilentlyContinue -ErrorVariable SearchErrors
-if ($SearchErrors) {
-    Write-Log "[ERROR] Fehler bei der Update-Suche: $SearchErrors"
-}
+# --- Updates suchen ------------------------------------------------------
+Write-Log INFO "Suche nach Updates..."
+$updates = @(Get-WindowsUpdate -MicrosoftUpdate -ErrorAction SilentlyContinue -ErrorVariable searchErr)
+if ($searchErr) { Write-Log ERROR "Fehler bei der Suche: $searchErr" }
 
 if ($updates.Count -eq 0) {
-    Write-Log "[INFO] Keine Updates verfügbar."
-    Write-Host "Keine Updates gefunden."
+    Write-Log INFO "Keine Updates verfuegbar."
 } else {
-    Write-Log "[INFO] Updates gefunden:"
-    foreach ($update in $updates) {
-        Write-Log " - $($update.Title)"
-        Write-Host "Gefundenes Update: $($update.Title)"
-    }
+    Write-Log INFO "$($updates.Count) Update(s) gefunden:"
+    $updates | ForEach-Object { Write-Log INFO " - $($_.Title) ($($_.Size))" }
 
-    # Updates installieren
-    Write-Log "[INFO] Installation der Updates startet..."
-    $results = Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose -ErrorAction Continue -ErrorVariable UpdateErrors
-    foreach ($result in $results) {
-        Write-Log "[INFO] Installiert: $($result.Title) - Result: $($result.ResultCode)"
-        Write-Host "Installiert: $($result.Title) - Result: $($result.ResultCode)"
+    # --- Download + Installation, ohne Benutzerinteraktion --------------
+    # -IgnoreReboot: Neustart wird unten kontrolliert geplant.
+    Write-Log INFO "Starte Download und Installation..."
+    $results = Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -Download -Install `
+                 -IgnoreReboot -Verbose -ErrorAction Continue -ErrorVariable installErr
+    foreach ($r in $results) {
+        Write-Log INFO "Installiert: $($r.Title) - Result: $($r.Result)"
     }
-    if ($UpdateErrors) {
-        foreach ($err in $UpdateErrors) {
-            Write-Log "[ERROR] Fehler bei der Installation: $err"
-            Write-Host "[ERROR] Fehler bei der Installation: $err"
-        }
-    }
+    if ($installErr) { $installErr | ForEach-Object { Write-Log ERROR "Installationsfehler: $_" } }
 }
 
-# Prüfen, ob ein Neustart erforderlich ist
-Write-Log "[INFO] Pruefe, ob ein Neustart erforderlich ist..."
-if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
-    Write-Log "[INFO] Neustart erforderlich - plane Neustart um 04:04 Uhr."
-    Write-Host "[INFO] Neustart erforderlich - plane Neustart um 04:04 Uhr."
-
-    # Lösche ggf. alte geplante Aufgabe für Neustart
-    schtasks /delete /tn "Geplanter Neustart" /f | Out-Null
-    Write-Log "[INFO] Alte Neustart-Aufgabe geloescht (falls vorhanden)."
-
-    # Erstelle geplante Aufgabe für Neustart um 04:04 Uhr
-    schtasks /create /tn "Geplanter Neustart" /tr "shutdown /r /f /t 0" /sc once /st 04:04 /ru SYSTEM /f | Out-Null
-    Write-Log "[INFO] Geplanter Neustart um 04:04 Uhr erstellt."
+# --- Neustart, falls erforderlich ---------------------------------------
+# Loest den frueheren 'schtasks /st 04:04'-Fehler (feste Uhrzeit vor
+# aktueller Zeit) durch eine relative Frist von 5 Minuten.
+if (Get-WURebootStatus -Silent) {
+    Write-Log INFO "Neustart erforderlich - plane Neustart in 5 Minuten."
+    Start-Process shutdown.exe -ArgumentList '/r','/f','/t','300', `
+        '/c','"Windows Update: Neustart in 5 Minuten"' -NoNewWindow
 } else {
-    Write-Log "[INFO] Kein Neustart erforderlich."
-    Write-Host "[INFO] Kein Neustart erforderlich."
+    Write-Log INFO "Kein Neustart erforderlich."
 }
 
-# Prüfen und Erstellen der Cleanup-Aufgabe
-Write-Log "[INFO] Pruefe geplante Cleanup-Aufgabe..."
-$taskExists = schtasks /query /tn "Automatischer System-Cleanup" 2>$null
-if (-not $taskExists) {
-    Write-Log "[INFO] Erstelle geplante Aufgabe für automatischen Cleanup bei jedem Systemstart."
-    schtasks /create /tn "Automatischer System-Cleanup" /tr "cleanmgr /sagerun:0" /sc onstart /ru SYSTEM /RL HIGHEST /f | Out-Null
-    Write-Log "[INFO] Geplante Cleanup-Aufgabe erfolgreich erstellt."
-} else {
-    Write-Log "[INFO] Geplante Cleanup-Aufgabe existiert bereits."
-}
-
-# Abschluss des Prozesses
-Write-Log "[INFO] Update-Prozess abgeschlossen. -----------------------------"
-Write-Host "[INFO] Update-Prozess abgeschlossen."
+Write-Log INFO "===== Update-Lauf abgeschlossen ====="
